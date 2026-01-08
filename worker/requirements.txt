@@ -1,0 +1,7 @@
+boto3==1.35.99
+mysql-connector-python==9.1.0
+python-dotenv==1.1.0
+SQLAlchemy==2.0.41
+pydantic==2.11.4
+selenium==4.33.0
+pytz==2024.1
