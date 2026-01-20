@@ -44,7 +44,12 @@ class SQSProducerService:
                 self.sqs_client = boto3.client('sqs', region_name=aws_region)
 
             self.job_queue_url = settings.get("SQS_JOB_QUEUE_URL")
+            if self.job_queue_url:
+                self.job_queue_url = self.job_queue_url.strip()
+                
             self.job_dlq_url = settings.get("SQS_JOB_DLQ_URL")
+            if self.job_dlq_url:
+                self.job_dlq_url = self.job_dlq_url.strip()
 
             logger.info(f"SQS Producer initialized:")
             logger.info(f"  Job Queue (FIFO): {self.job_queue_url}")
@@ -260,7 +265,7 @@ class SQSProducerService:
             return None
 
     def _is_fifo_queue(self, queue_url: str) -> bool:
-        return queue_url and queue_url.endswith('.fifo') if queue_url else False
+        return queue_url and queue_url.strip().endswith('.fifo') if queue_url else False
 
     def _log_sent_message_to_db(
         self,

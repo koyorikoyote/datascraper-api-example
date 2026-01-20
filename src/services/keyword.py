@@ -10,8 +10,9 @@ import io
 from datetime import datetime, time, timedelta
 import urllib.parse
 import asyncio
+import time as time_module
 import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
 
 from src.models.keyword import Keyword
 from src.models.batch_history import BatchHistory
@@ -146,6 +147,12 @@ class KeywordService:
 
     def set_partial_rank_status(self, ids: list[int], status: str) -> None:
         self.set_keywords_status(ids, "partial_rank_status", status)
+
+    def fail_processing_serp_results(self, keyword_ids: list[int]) -> int:
+        """
+        Mark all processing SERP results for the given keywords as FAILED.
+        """
+        return self.serp_repo.update_processing_to_failed(keyword_ids)
 
 
     def _create_batch_history(
@@ -289,10 +296,7 @@ class KeywordService:
         for keyword_id in ids:
             keyword_obj = self.keyword_repo.get(keyword_id)
             if not keyword_obj:
-                continue
-            
-            # Note: We do NOT skip PROCESSING status anymore to allow retries
-            # We also moved the status update to later (just-in-time)
+                continue          
             
             keywords_to_process.append(keyword_id)
 
@@ -326,6 +330,17 @@ class KeywordService:
             except Exception as e:
                 from src.utils.cancellation import JobCancelledException
                 if isinstance(e, JobCancelledException):
+                    logging.info(f"Job {job_id} cancelled during fetch - resetting current and remaining keywords")
+                    # Reset current keyword
+                    if keyword_to_update:
+                        self.keyword_repo.update(keyword_to_update, KeywordUpdate(fetch_status=StatusConst.PENDING))
+                    
+                    # Reset remaining keywords
+                    current_idx = keywords_to_process.index(keyword_id)
+                    for remaining_id in keywords_to_process[current_idx + 1:]:
+                        remaining_keyword = self.keyword_repo.get(remaining_id)
+                        if remaining_keyword:
+                            self.keyword_repo.update(remaining_keyword, KeywordUpdate(fetch_status=StatusConst.PENDING))
                     raise  # Re-raise cancellation exceptions
                 
                 logging.error(
@@ -358,12 +373,19 @@ class KeywordService:
             raise ValueError(f"Failed to fetch SERP for keyword={keyword_obj.keyword}")
                 
         seen_links = set()
+        seen_domains = set()
         filtered_items = []
         for idx, item in enumerate(items, start=1):
             link = item.get("link", "")
             if link and link not in seen_links:
-                seen_links.add(link)
                 serp_domain = (get_bare_domain(link) or "").lower().lstrip(".")
+                
+                # Filter out duplicate domains
+                if serp_domain in seen_domains:
+                    continue
+                seen_domains.add(serp_domain)
+                
+                seen_links.add(link)
                 match_list = self.hubspot_service.list_companies(token, limit=1, domain=serp_domain)
                 is_hubspot_duplicate = True if match_list else False
 
@@ -450,12 +472,27 @@ class KeywordService:
                     raise JobCancelledException(job_id, "Rank job cancelled by user")
             
             try:
+                # Reset FAILED items to PENDING so they are included in this run (manual retry)
+                # This works in tandem with _process_keyword_for_rank skipping FAILED items
+                self.serp_repo.update_failed_to_pending(keyword_id)
+
                 self._process_keyword_for_rank(
-                    keyword_id, score_setting
+                    keyword_id, score_setting, job_id=job_id
                 )
             except Exception as e:
                 from src.utils.cancellation import JobCancelledException
                 if isinstance(e, JobCancelledException):
+                    logging.info(f"Job {job_id} cancelled during rank - resetting current and remaining keywords")
+                    # Reset current keyword
+                    if keyword_to_update:
+                        self.keyword_repo.update(keyword_to_update, KeywordUpdate(rank_status=StatusConst.PENDING))
+                    
+                    # Reset remaining keywords
+                    current_idx = keywords_to_process.index(keyword_id)
+                    for remaining_id in keywords_to_process[current_idx + 1:]:
+                        remaining_keyword = self.keyword_repo.get(remaining_id)
+                        if remaining_keyword:
+                            self.keyword_repo.update(remaining_keyword, KeywordUpdate(rank_status=StatusConst.PENDING))
                     raise  # Re-raise cancellation exceptions
                 logging.error(
                     "Unexpected Error at run_rank for keyword_id %s: %s",
@@ -531,12 +568,27 @@ class KeywordService:
                     raise JobCancelledException(job_id, "Partial rank job cancelled by user")
             
             try:
+                # Reset FAILED items to PENDING so they are included in this run (manual retry)
+                # This works in tandem with _process_keyword_for_partial_rank skipping FAILED items
+                self.serp_repo.update_failed_to_pending(keyword_id)
+
                 self._process_keyword_for_partial_rank(
-                    keyword_id, score_setting
+                    keyword_id, score_setting, job_id=job_id
                 )
             except Exception as e:
                 from src.utils.cancellation import JobCancelledException
                 if isinstance(e, JobCancelledException):
+                    logging.info(f"Job {job_id} cancelled during partial rank - resetting current and remaining keywords")
+                    # Reset current keyword
+                    if keyword_to_update:
+                        self.keyword_repo.update(keyword_to_update, KeywordUpdate(partial_rank_status=StatusConst.PENDING))
+                    
+                    # Reset remaining keywords
+                    current_idx = keywords_to_process.index(keyword_id)
+                    for remaining_id in keywords_to_process[current_idx + 1:]:
+                        remaining_keyword = self.keyword_repo.get(remaining_id)
+                        if remaining_keyword:
+                            self.keyword_repo.update(remaining_keyword, KeywordUpdate(partial_rank_status=StatusConst.PENDING))
                     raise  # Re-raise cancellation exceptions
                 logging.error(
                     "Unexpected Error at run_partial_rank for keyword_id %s: %s",
@@ -931,6 +983,7 @@ class KeywordService:
         self,
         keyword_id: int,
         score_setting: ScoreSetting,
+        job_id: str = None,
     ):
         keyword_obj = self.keyword_repo.get(keyword_id)
         user_obj = self.user_repo.get(keyword_obj.created_by_user_id)
@@ -947,52 +1000,67 @@ class KeywordService:
                 keyword_id,
             )
 
-            # Initialize SeleniumService manually since we might need to recreate it on timeout
+            # Initialize SeleniumService once for all items
             selenium_service = SeleniumService()
-            
+
             try:
-                for serp in serp_results:
+                for idx, serp in enumerate(serp_results):
+                    # Skip previously failed items to avoid re-processing loop after crash
+                    if serp.status == StatusConst.FAILED:
+                        logging.warning(
+                            "Skipping previously FAILED item for serp_id %s to avoid re-processing loop.",
+                            serp.id,
+                        )
+                        continue
+
+                    # Check for cancellation
+                    if job_id:
+                        from src.utils.cancellation import check_cancellation_and_raise
+                        check_cancellation_and_raise(job_id, self.keyword_repo.db)
+
                     try:
-                        # Use ThreadPoolExecutor to enforce timeout on single SERP processing
-                        # We create a new executor for each item to ensure we can abandon a hung thread immediately
-                        with ThreadPoolExecutor(max_workers=1) as executor:
-                            future = executor.submit(self._process_serp, serp, score_setting, selenium_service, user_obj)
-                            # Wait up to 240 seconds (4 minutes) for one result
-                            future.result(timeout=240)
-                    except TimeoutError:
-                        logging.error("Timeout processing serp %s - recreating Selenium driver", serp.id)
+                        # Process SERP with timeout handling
+                        self._process_serp_with_timeout(
+                            serp, score_setting, selenium_service, user_obj, timeout=240
+                        )
                         
+                        # Add delay between items to allow memory cleanup - keeping this from original logic
+                        if idx < len(serp_results) - 1:
+                            time_module.sleep(1.0)
+                            
+                    except TimeoutError:
+                        logging.error("Timeout processing serp %s", serp.id)
+                        # Reset driver to kill any stuck threads/requests
+                        selenium_service.reset_driver()
                         # Mark SERP as failed due to timeout
                         self.serp_repo.update(serp, SearchResultUpdate(status=StatusConst.FAILED))
-                        
-                        # Aggressively cleanup the old hung service and create a new one
-                        try:
-                            selenium_service._cleanup(force=True)
-                        except Exception as cleanup_error:
-                            logging.error("Error cleaning up hung selenium service: %s", cleanup_error)
-                        
-                        # Recreate service for next iteration
-                        selenium_service = SeleniumService()
-                        continue
                         
                     except Exception as e:
                         logging.error(
                             "Error on _process_serp for serp_id %s: %s", serp.id, str(e)
                         )
+                        # Ensure we mark as failed if not already handled
+                        self.serp_repo.update(serp, SearchResultUpdate(status=StatusConst.FAILED))
                         continue
             finally:
-                # Ensure we clean up the final service instance
-                if selenium_service:
-                    selenium_service._cleanup()
+                # Clean up the selenium service after all items are processed
+                try:
+                    selenium_service._cleanup(force=True)
+                except Exception as cleanup_error:
+                    logging.error("Error cleaning up selenium service: %s", cleanup_error)
 
             # Check for failed SERP results
             failed_count = self.serp_repo.count_failed_by_keyword(keyword_id)
+            total_count = self.serp_repo.count_by_keyword(keyword_id)
             final_status = StatusConst.SUCCESS
             
-            if failed_count >= 3:
+            # Fail if 1/3 or more of items failed
+            threshold = math.ceil(total_count / 3) if total_count > 0 else 3
+            
+            if failed_count >= threshold:
                 logging.warning(
-                    "Keyword %d has %d failed SERP results (>= 3) -> setting rank_status to FAILED",
-                    keyword_id, failed_count
+                    "Keyword %d has %d failed SERP results (>= %d) -> setting rank_status to FAILED",
+                    keyword_id, failed_count, threshold
                 )
                 final_status = StatusConst.FAILED
 
@@ -1010,6 +1078,7 @@ class KeywordService:
         self,
         keyword_id: int,
         score_setting: ScoreSetting,
+        job_id: str = None,
     ):
         """Process keyword for partial ranking - only specific fields"""
         keyword_obj = self.keyword_repo.get(keyword_id)
@@ -1036,6 +1105,19 @@ class KeywordService:
             )
 
             for serp in serp_results:
+                # Skip previously failed items to avoid re-processing loop after crash
+                if serp.status == StatusConst.FAILED:
+                    logging.warning(
+                        "Skipping previously FAILED item for serp_id %s to avoid re-processing loop.",
+                        serp.id,
+                    )
+                    continue
+
+                # Check for cancellation
+                if job_id:
+                    from src.utils.cancellation import check_cancellation_and_raise
+                    check_cancellation_and_raise(job_id, self.keyword_repo.db)
+                    
                 try:
                     self._process_serp_partial(serp, score_setting, user_obj, keyword_obj, service_volume)
                 except Exception as e:
@@ -1045,12 +1127,16 @@ class KeywordService:
                     continue
             # Check for failed SERP results
             failed_count = self.serp_repo.count_failed_by_keyword(keyword_id)
+            total_count = self.serp_repo.count_by_keyword(keyword_id)
             final_status = StatusConst.SUCCESS
             
-            if failed_count >= 3:
+            # Fail if 1/3 or more of items failed
+            threshold = math.ceil(total_count / 3) if total_count > 0 else 3
+            
+            if failed_count >= threshold:
                 logging.warning(
-                    "Keyword %d has %d failed SERP results (>= 3) -> setting partial_rank_status to FAILED",
-                    keyword_id, failed_count
+                    "Keyword %d has %d failed SERP results (>= %d) -> setting partial_rank_status to FAILED",
+                    keyword_id, failed_count, threshold
                 )
                 final_status = StatusConst.FAILED
 
@@ -1063,6 +1149,43 @@ class KeywordService:
                 keyword_obj, KeywordUpdate(partial_rank_status=StatusConst.FAILED)
             )
             raise
+
+    def _process_serp_with_timeout(
+        self,
+        serp: SerpResultInDBBase,
+        score_setting: ScoreSetting,
+        selenium_service: SeleniumService,
+        user_obj: User,
+        timeout: int = 240,
+    ) -> None:
+        """
+        Wrapper for _process_serp with timeout handling.
+        Uses a simple time-based check instead of signal/multiprocessing for cross-platform compatibility.
+        """
+        import threading
+        
+        result = {"success": False, "error": None}
+        
+        def worker():
+            try:
+                self._process_serp(serp, score_setting, selenium_service, user_obj)
+                result["success"] = True
+            except Exception as e:
+                result["error"] = e
+        
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        thread.join(timeout=timeout)
+        
+        if thread.is_alive():
+            # Thread is still running after timeout
+            logging.error(f"SERP processing timed out after {timeout}s for serp_id {serp.id}")
+            # Mark as failed and raise TimeoutError
+            # The selenium_service cleanup in the batch handler will kill the Chrome process
+            raise TimeoutError(f"Processing timed out after {timeout} seconds")
+        
+        if result["error"]:
+            raise result["error"]
 
     @track_batch_detail()
     def _process_serp(
@@ -1079,27 +1202,132 @@ class KeywordService:
             )
 
             domain_url = get_domain_url(serp.link)
-            link_list = [domain_url]
-            all_possible_links_list = selenium_service.get_all_possible_links(
-                domain_url
-            )
+            
+            # Tiered fetching strategy:
+            # 1. Domain URL
+            # 2. Original SERP Link
+            # 3. Parent Directory of SERP Link
+            
+            # Helper to get parent directory
+            def _get_parent_url(u: str) -> str | None:
+                try:
+                    parsed = urllib.parse.urlparse(u)
+                    path = parsed.path
+                    if path == "" or path == "/":
+                        return None
+                    # If it ends with slash, strip it to go up
+                    if path.endswith("/"):
+                        path = path[:-1]
+                    
+                    # Split and remove last component
+                    parts = path.split("/")
+                    if len(parts) <= 1:
+                        return None
+                        
+                    new_path = "/".join(parts[:-1])
+                    if not new_path.endswith("/"):
+                         new_path += "/"
+                    
+                    return parsed._replace(path=new_path, query="", fragment="").geturl()
+                except Exception:
+                    return None
+
+            candidate_urls = []
+            if domain_url:
+                candidate_urls.append(domain_url)
+            
+            if serp.link and serp.link not in candidate_urls:
+                candidate_urls.append(serp.link)
+                
+            parent_url = _get_parent_url(serp.link)
+            if parent_url and parent_url not in candidate_urls:
+                candidate_urls.append(parent_url)
+            
+            all_possible_links_list = []
+            initial_text = None
+            successful_url = None
+
+            for url in candidate_urls:
+                logging.info(f"Attempting to fetch main page data from: {url}")
+                current_links, current_text, effective_url = selenium_service.fetch_main_page_data(
+                    url, max_retries=2
+                )
+
+                # Check protocol correction (HTTPS -> HTTP)
+                if effective_url != url and "http://" in effective_url and "https://" in url:
+                    logging.warning(f"Protocol correction detected. Updating SERP link from {url} to {effective_url}")
+                    # Update the SERP result in DB with the working HTTP link
+                    try:
+                        self.serp_repo.update(serp, SearchResultUpdate(link=effective_url))
+                        # Also update local serp reference just in case
+                        serp.link = effective_url 
+                    except Exception as db_err:
+                        logging.error(f"Failed to update SERP link in DB: {db_err}")
+                
+                # If we got substantial content, stop
+                if current_text and len(current_text) >= 50:
+                    all_possible_links_list = current_links
+                    initial_text = current_text
+                    successful_url = url
+                    logging.info(f"Successfully fetched data from {url}")
+                    break
+                else:
+                    logging.warning(f"Fetch failed or content too short for {url}")
+            
+            # If all failed, use domain_url as fallback for cache key to avoid errors downstream, 
+            # though content is empty
+            if not successful_url:
+                 successful_url = domain_url
+            
+            # Soft check for content length
+            if not initial_text or len(initial_text) < 50:
+                logging.warning("Main page content too short or empty for serp_id %s (length: %d). Attempting fallback strategy.", serp.id, len(initial_text) if initial_text else 0)
+                
+                # If we have very little content, we might have missed links too.
+                # Inject common fallback paths to try and "rescue" the ranking
+                fallback_paths = [
+                    "about", "company", "company/", "corporate", "profile", "gaiyo", # About/Company
+                    "contact", "inquiry", "form", "ask" # Contact
+                ]
+                
+                # Ensure we have a list
+                if not all_possible_links_list:
+                    all_possible_links_list = []
+                    
+                # Add these as absolute URLs
+                from urllib.parse import urljoin
+                for path in fallback_paths:
+                    candidate = urljoin(domain_url, path)
+                    # Add strictly if not already present (naive check)
+                    if candidate not in all_possible_links_list:
+                        all_possible_links_list.append(candidate)
+                        
+                # We do NOT return here. We let it proceed to GPT to pick from these candidate links.
+                # If GPT picks them, we will try to fetch them. If they fail (404), _gather_link_texts handles it.
+            
+            # Additional safety: if list is still empty, add at least successful_url
+            if not all_possible_links_list:
+                all_possible_links_list = [successful_url]
 
             link_gpt = self._get_links_gpt(all_possible_links_list, serp.id)
-
-            if not link_gpt:
-                logging.warning("Failed to get links from GPT for serp_id %s", serp.id)
-                self.serp_repo.update(
-                    serp, SearchResultUpdate(status=StatusConst.FAILED)
-                )
-                return
-
-            if link_gpt.about:
-                link_list.append(link_gpt.about)
-            if link_gpt.contact:
-                link_list.append(link_gpt.contact)
+            
+            link_list = [successful_url]
+            if link_gpt:
+                if link_gpt.about:
+                    link_list.append(link_gpt.about)
+                    # Also add /company as additional fallback for About pages
+                    from urllib.parse import urljoin
+                    company_url = urljoin(successful_url, "company")
+                    if company_url not in link_list and company_url != link_gpt.about:
+                        link_list.append(company_url)
+                if link_gpt.contact:
+                    link_list.append(link_gpt.contact)
+            else:
+                logging.warning("Failed to get links from GPT for serp_id %s - falling back to successful_url only", serp.id)
 
             logging.info("Gathering text content from links: %s", link_list)
-            text_content = self._gather_link_texts(selenium_service, link_list)
+            # Pass initial_text mapped to successful_url so we don't re-fetch it
+            text_content = self._gather_link_texts(selenium_service, link_list, initial_cache={successful_url: initial_text})
             logging.info("Fetched text content: %d chars", len(text_content))
 
             if not text_content:
@@ -1109,8 +1337,8 @@ class KeywordService:
                 )
                 return
 
-            if not text_content:
-                logging.warning("Failed to text_content %s", serp.id)
+            if not text_content or len(text_content) < 50:
+                logging.warning("Text content too short or empty for serp_id %s (length: %d)", serp.id, len(text_content) if text_content else 0)
                 self.serp_repo.update(
                     serp, SearchResultUpdate(status=StatusConst.FAILED)
                 )
@@ -1150,7 +1378,7 @@ class KeywordService:
                 ),
             )
         except Exception as e:
-            logging.warning("Exceptipn %s: %s", serp.id, e)
+            logging.warning("Exception %s: %s", serp.id, e)
             self.serp_repo.update(serp, SearchResultUpdate(status=StatusConst.FAILED))
             raise
 
@@ -1202,17 +1430,30 @@ class KeywordService:
             raise
 
     def _gather_link_texts(
-        self, selenium_service: SeleniumService, link_list: list[str]
+        self, 
+        selenium_service: SeleniumService, 
+        link_list: list[str],
+        initial_cache: dict[str, str] = None
     ) -> str:
         """
         Download visible text from every URL in ``link_list`` and return one
         newline-separated string.  If a page cannot be fetched, it is skipped.
+        
+        Args:
+            initial_cache: Dict of {url: text} for content already fetched.
         """
         text_content: list[str] = []  # initialise once, as a list
+        cache = initial_cache or {}
 
         for link in link_list:
             try:
-                page_text = selenium_service.get_text_content(link)
+                # Use cached content if available and valid
+                if link in cache and cache[link]:
+                    logging.info("Using cached content for %s", link)
+                    text_content.append(cache[link].strip())
+                    continue
+                    
+                page_text = selenium_service.get_text_content(link, max_retries=2)
                 if page_text:
                     text_content.append(page_text.strip())
             except Exception as e:
@@ -1258,8 +1499,17 @@ class KeywordService:
         raw_volume = 0
         candidate_keyword: list[CandidateKeyword] = []
 
-        for candidate_key in gpt_res.keyword:
-            candidate_volume = self.serp_service.fetch_search_volume(candidate_key)
+        # Collect all candidate keywords
+        candidate_keys = [key for key in gpt_res.keyword if key]
+        
+        # Batch fetch their volumes
+        if candidate_keys:
+            volume_map = self.serp_service.fetch_search_volumes_batch(candidate_keys)
+        else:
+            volume_map = {}
+
+        for candidate_key in candidate_keys:
+            candidate_volume = volume_map.get(candidate_key, 0)
             raw_volume += candidate_volume
             candidate_keyword.append(
                 CandidateKeyword(keyword=candidate_key, volume=candidate_volume)

@@ -81,6 +81,20 @@ class SQSConsumer:
                 if messages:
                     consecutive_errors = 0
                     for message in messages:
+                        if not self.running:
+                            # Worker is shutting down, return message to queue immediately
+                            logger.info("Shutdown detected, returning message to queue...")
+                            try:
+                                self.sqs_client.change_message_visibility(
+                                    QueueUrl=self.queue_url,
+                                    ReceiptHandle=message['ReceiptHandle'],
+                                    VisibilityTimeout=0
+                                )
+                                logger.info(f"Returned message {message.get('MessageId')} to queue (VisibilityTimeout=0)")
+                            except Exception as e:
+                                logger.error(f"Failed to return message to queue: {str(e)}")
+                            continue
+
                         self._process_message(message)
                 else:
                     logger.info("No messages received, waiting...")
@@ -228,8 +242,9 @@ class SQSConsumer:
 
             # Start visibility extender for long-running jobs
             # Jobs with 25+ keywords are considered large and may need extended time
+            # full_rank jobs process 100 items per keyword so they always need extended time
             visibility_extender = None
-            if len(keyword_ids) >= 25:  # 25 or more keywords might take long
+            if len(keyword_ids) >= 25 or message_type == 'full_rank':
                 visibility_extender = VisibilityExtender(
                     self.sqs_client,
                     self.queue_url,
@@ -237,7 +252,7 @@ class SQSConsumer:
                     message_id
                 )
                 visibility_extender.start()
-                logger.info(f"Started visibility extender for large job with {len(keyword_ids)} keywords")
+                logger.info(f"Started visibility extender for job {job_id} (keywords={len(keyword_ids)}, type={message_type})")
 
             try:
                 # Process the job using unified processor
@@ -438,6 +453,13 @@ class SQSConsumer:
             try:
                 service = KeywordService(db)
                 service.set_keywords_status(keyword_ids, status_field, StatusConst.FAILED)
+                
+                # Also fail any stuck SERP results for these keywords
+                # This ensures that if the job crashes, individual rows don't stay in PROCESSING
+                count = service.fail_processing_serp_results(keyword_ids)
+                if count > 0:
+                    logger.info(f"Marked {count} stuck SERP results as FAILED for keywords {keyword_ids}")
+
                 logger.info(f"Marked {len(keyword_ids)} keywords as FAILED in {status_field}")
             except Exception as e:
                 logger.error(f"Failed to update keyword status to FAILED: {str(e)}")

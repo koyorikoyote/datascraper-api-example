@@ -115,7 +115,23 @@ class SerpService:
             request.keyword_plan_network = (
                 self.ads_client.enums.KeywordPlanNetworkEnum.GOOGLE_SEARCH
             )
-            request.keywords.append(keyword)
+            # Sanitize and truncate keyword to fit Google Ads limits (80 bytes)
+            cleaned_keyword = keyword.strip() if keyword else ""
+            if not cleaned_keyword:
+                return 0
+
+            encoded = cleaned_keyword.encode("utf-8")
+            if len(encoded) > 80:
+                # Truncate to 80 bytes and decode back, ignoring incomplete bytes at the end
+                truncated_keyword = encoded[:80].decode("utf-8", errors="ignore")
+                logging.warning(
+                    "Keyword truncated for Google Ads limit: '%s' -> '%s'", 
+                    cleaned_keyword, 
+                    truncated_keyword
+                )
+                request.keywords.append(truncated_keyword)
+            else:
+                request.keywords.append(cleaned_keyword)
 
             request.geo_target_constants.append(f"geoTargetConstants/{self.geo_id}")
             request.language = f"languageConstants/{self.lang_id}"
@@ -152,3 +168,102 @@ class SerpService:
             return 0
 
         return total_searches // months_count
+
+    @try_except_decorator_no_raise(fallback_value={})
+    def fetch_search_volumes_batch(self, keywords: List[str]) -> Dict[str, int]:
+        """
+        Return the average monthly search volume for a list of `keywords`
+        using Google Ads KeywordPlanIdeaService in a single batched request.
+
+        Args:
+            keywords (List[str]): The list of keywords to query.
+
+        Returns:
+            Dict[str, int]: Dictionary mapping keyword to average monthly search volume.
+                           Keywords with no data or errors will have value 0.
+        """
+        if not keywords:
+            return {}
+
+        @retry_on_429(max_retries=5, initial_wait=1)
+        def _make_ads_request(batch_keywords: List[str]):
+            idea_service = self.ads_client.get_service("KeywordPlanIdeaService")
+            request = self.ads_client.get_type("GenerateKeywordHistoricalMetricsRequest")
+            request.customer_id = self.ads_customer_id
+            request.keyword_plan_network = (
+                self.ads_client.enums.KeywordPlanNetworkEnum.GOOGLE_SEARCH
+            )
+            
+            # Process keywords: trim, truncate to 80 bytes, remove empty
+            valid_keywords = []
+            for k in batch_keywords:
+                cleaned = k.strip() if k else ""
+                if not cleaned:
+                    continue
+                    
+                encoded = cleaned.encode("utf-8")
+                if len(encoded) > 80:
+                    truncated = encoded[:80].decode("utf-8", errors="ignore")
+                    logging.warning(
+                        "Keyword truncated for Google Ads limit: '%s' -> '%s'", 
+                        cleaned, truncated
+                    )
+                    valid_keywords.append(truncated)
+                else:
+                    valid_keywords.append(cleaned)
+            
+            if not valid_keywords:
+                return None
+
+            request.keywords.extend(valid_keywords)
+            request.geo_target_constants.append(f"geoTargetConstants/{self.geo_id}")
+            request.language = f"languageConstants/{self.lang_id}"
+
+            try:
+                return idea_service.generate_keyword_historical_metrics(request=request)
+            except GoogleAdsException as e:
+                # Check for rate limit error
+                for error in e.failure.errors:
+                    if "RESOURCE_EXHAUSTED" in str(error.error_code) or "quota" in str(error.message).lower():
+                        class MockResponse:
+                            status_code = 429
+                        return MockResponse()
+                raise
+
+        # Log the batch size
+        logging.info(f"Fetching search volumes for {len(keywords)} keywords")
+        
+        # Initialize result dictionary with 0 for all input keywords
+        results = {k: 0 for k in keywords}
+        
+        # Google Ads API might have a limit on number of keywords per request (so do batching by 50 to be safe)
+        batch_size = 50
+        for i in range(0, len(keywords), batch_size):
+            batch = keywords[i:i + batch_size]
+            response = _make_ads_request(batch)
+            
+            # Check for 429 exhaustion
+            if hasattr(response, 'status_code') and response.status_code == 429:
+                logging.error("Google Ads quota exhausted during batch fetch")
+                continue
+
+            if response and response.results:
+                for result in response.results:
+                    # The text field in result might be slightly different if normalized by Google,try to match with input keywords
+                    res_text = result.text
+                    
+                    total_searches = 0
+                    months_count = 0
+                    for msv in result.keyword_metrics.monthly_search_volumes:
+                        total_searches += msv.monthly_searches
+                        months_count += 1
+                    
+                    avg_volume = total_searches // months_count if months_count > 0 else 0
+                    
+                    # Update result for this keyword, loop through original keys to find matches because Google might return normalized text (case insensitive match)
+                    for k in batch:
+                        if k.lower().strip() == res_text.lower().strip():
+                            results[k] = avg_volume
+
+        return results
+
