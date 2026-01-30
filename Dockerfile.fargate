@@ -27,12 +27,14 @@ COPY ./src ./src
 COPY ./alembic.ini .
 COPY ./alembic ./alembic
 COPY ./scripts ./scripts
+COPY ./worker ./worker
 
 # ---- Selenium (optimized) ---------------------------------------------------
 COPY docker-entrypoint.fargate.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh && \
-    # Fix the detect-drivers issue in the start-selenium-standalone.sh script
-    sed -i 's/--detect-drivers false//' /opt/bin/start-selenium-standalone.sh
+COPY docker-entrypoint-worker.sh /usr/local/bin/docker-entrypoint-worker.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+    && chmod +x /usr/local/bin/docker-entrypoint-worker.sh \
+    && sed -i 's/--detect-drivers false//' /opt/bin/start-selenium-standalone.sh
 ENV DISPLAY=:99
 
 # ---- Performance optimizations for constrained environments ----------------

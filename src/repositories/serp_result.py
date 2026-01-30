@@ -36,7 +36,7 @@ class SerpResultRepository:
             self.db.query(SerpResult)
             .filter(SerpResult.keyword_id == keyword_id)
             .filter(SerpResult.status.in_(
-                [StatusConst.PENDING, StatusConst.FAILED, StatusConst.PARTIAL]))
+                [StatusConst.PENDING, StatusConst.FAILED, StatusConst.PARTIAL, StatusConst.PROCESSING]))
             .order_by(SerpResult.position)
             .offset(skip)
         )
@@ -131,6 +131,34 @@ class SerpResultRepository:
         
         return {"status_updated": count}
 
+    def update_failed_to_pending(self, keyword_id: int) -> int:
+        """
+        Update FAILED SERP results to PENDING for a specific keyword.
+        Used to reset status when manually re-running a job.
+        
+        Args:
+            keyword_id: The keyword ID to update
+        
+        Returns:
+            Count of updated records
+        """
+        if keyword_id is None:
+            return 0
+            
+        condition = (SerpResult.status == StatusConst.FAILED) & (SerpResult.keyword_id == keyword_id)
+        
+        query = (
+            update(SerpResult)
+            .where(condition)
+            .values(status=StatusConst.PENDING)
+            .execution_options(synchronize_session=False)
+        )
+        result = self.db.execute(query)
+        count = result.rowcount
+        
+        self.db.commit()
+        return count
+
     def count_failed_by_keyword(self, keyword_id: int) -> int:
         """
         Count the number of FAILED SERP results for a given keyword.
@@ -141,3 +169,33 @@ class SerpResultRepository:
             .filter(SerpResult.status == StatusConst.FAILED)
             .count()
         )
+
+    def count_by_keyword(self, keyword_id: int) -> int:
+        """
+        Count the total number of SERP results for a given keyword.
+        """
+        return (
+            self.db.query(SerpResult)
+            .filter(SerpResult.keyword_id == keyword_id)
+            .count()
+        )
+
+    def update_processing_to_failed(self, keyword_ids: List[int]) -> int:
+        """
+        Update SERP results with 'processing' status to 'failed' for specific keywords.
+        """
+        if not keyword_ids:
+            return 0
+            
+        condition = (SerpResult.status == StatusConst.PROCESSING) & (SerpResult.keyword_id.in_(keyword_ids))
+        
+        query = (
+            update(SerpResult)
+            .where(condition)
+            .values(status=StatusConst.FAILED)
+            .execution_options(synchronize_session=False)
+        )
+        result = self.db.execute(query)
+        count = result.rowcount
+        self.db.commit()
+        return count

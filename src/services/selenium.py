@@ -7,6 +7,7 @@ import socket
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from bs4 import BeautifulSoup, Comment
+import httpx
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -30,12 +31,19 @@ COLUMN_ORDER = [
     "subject", "body",
 ]
 
+
+class RendererTimeoutError(Exception):
+    """Raised when Selenium renderer times out, indicating a critical page failure."""
+    pass
+
+
 class SeleniumService:
     """Chrome in a container-friendly, headless configuration."""
 
     def __init__(
         self,
         headless: bool = True,
+        # Environment variable for Selenium Grid URL has to be localhost even in production
         remote_url: str = get_env("SELENIUM_GRID_URL", default="http://localhost:4444/wd/hub"),
     ) -> None:
         self.headless = headless
@@ -59,6 +67,9 @@ class SeleniumService:
         self.driver = self._create_driver()
 
         atexit.register(self._cleanup)
+
+        # Suppress benign "Connection pool is full" warnings from urllib3
+        logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
         
     def _create_driver(self):
         """Create a new WebDriver instance with the configured options."""
@@ -67,6 +78,10 @@ class SeleniumService:
         # Choose headless vs headed
         if self.headless:
             opts.add_argument("--headless")
+
+        # Set page load strategy to eager to fix timeouts on heavy sites
+        # This makes Selenium return control as soon as DOM is interactive
+        opts.page_load_strategy = 'eager'
 
         # Common hardening flags
         opts.add_argument("--disable-gpu")
@@ -81,11 +96,14 @@ class SeleniumService:
         opts.add_argument("--disable-application-cache")
         opts.add_argument("--disable-session-storage")
 
+        # Set a common User-Agent to avoid simple bot blocking (which causes timeouts)
+        opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
         # Connect to the Grid running on port 4444 
         logging.info("Creating new WebDriver session")
         
         driver = None
-        max_retries = 5
+        max_retries = 2 # Changed from 5 to 2 as per requirement (1 retry only)
         retry_delay = 5
         
         for attempt in range(max_retries):
@@ -97,6 +115,14 @@ class SeleniumService:
                 )
                 break
             except Exception as e:
+                # Attempt to cleanup any partial/stuck session if we have a reference
+                # This mirrors the reset_driver behavior requested as fallback
+                try:
+                    if hasattr(self, 'driver') and self.driver:
+                        self.driver.quit()
+                except Exception:
+                    pass
+
                 error_msg = str(e)
                 if attempt < max_retries - 1:
                     wait_time = retry_delay
@@ -106,6 +132,11 @@ class SeleniumService:
                         logging.warning(f"Gateway Timeout (504) detected. Infrastructure might be overloaded.")
                         wait_time = 45 # Wait 45s to allow container/service recovery
                     
+                    # Check for Session Creation Timeout specifically
+                    if "New session request timed out" in error_msg:
+                        logging.warning(f"Session creation timed out. Grid might be overloaded.")
+                        wait_time = 45 # Wait 45s to allow Grid recovery
+
                     logging.warning(
                         f"Failed to create WebDriver session (attempt {attempt + 1}/{max_retries}). "
                         f"Retrying in {wait_time}s... Error: {error_msg[:200]}"
@@ -156,9 +187,23 @@ class SeleniumService:
             except Exception:
                 pass  # Ignore errors when quitting an already invalid driver
                 
-            # Create a new driver
             self.driver = self._create_driver()
             logging.info("WebDriver session recreated successfully")
+
+    def reset_driver(self):
+        """
+        Forcefully quit the current driver and create a new one.
+        Useful when a thread is stuck or the driver is in a bad state.
+        """
+        try:
+            logging.warning("offloading stuck driver...")
+            if self.driver:
+                self.driver.quit()
+        except Exception as e:
+            logging.warning(f"Error quitting driver during reset: {e}")
+        
+        logging.info("Creating new driver session...")
+        self.driver = self._create_driver()
 
     def _reset_state(self):
         """
@@ -190,6 +235,49 @@ class SeleniumService:
                 pass
             self.driver = self._create_driver()
 
+    def _fallback_fetch_httpx(self, url: str) -> tuple[list[str], str | None, str]:
+        """
+        Fallback method to fetch content using httpx when Selenium fails (e.g. renderer timeout).
+        Returns: (list_of_links, text_content, effective_url)
+        """
+        try:
+            logging.warning(f"Attempting HTTPX fallback for {url}")
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            # Use a slightly longer timeout for stability
+            response = httpx.get(url, timeout=30.0, follow_redirects=True, headers=headers)
+            response.raise_for_status()
+            
+            # Use response.encoding if available, else charset detection is automatic
+            html_content = response.text
+            effective_url = str(response.url)
+            
+            soup = BeautifulSoup(html_content, "html.parser")
+            
+            # --- Extract Links ---
+            links = set()
+            for a in soup.find_all("a", href=True):
+                links.add(urljoin(effective_url, a["href"]))
+            
+            # --- Extract Text ---
+            # Reuse cleanup logic briefly
+            blacklist_tags = ["script", "style", "noscript", "form", "svg", "canvas", "iframe", "button", "input", "select", "option", "link", "meta", "object", "embed", "video", "audio"]
+            for tag in soup(blacklist_tags):
+                tag.decompose()
+            for element in soup(text=lambda t: isinstance(t, Comment)):
+                element.extract()
+            
+            text_content = soup.get_text(separator=" ", strip=True) or ""
+            text_content = " ".join(text_content.split())
+            
+            logging.info(f"HTTPX fallback successful for {url}. Links: {len(links)}, Text: {len(text_content)}")
+            return list(links), text_content, effective_url
+
+        except Exception as e:
+            logging.error(f"HTTPX fallback failed for {url}: {e}")
+            return [], None, url
+
     def __enter__(self):
         return self
 
@@ -202,21 +290,55 @@ class SeleniumService:
             logging.info("Keeping browser open due to failure")
             return
             
+        # Try to quit the driver multiple times with increasing delays
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                if hasattr(self, 'driver') and self.driver:
+                    self.driver.quit()
+                    # Give Chrome time to fully shut down
+                    time.sleep(1.0 if attempt == 0 else 2.0)
+                    break
+            except Exception as e:
+                # If session is already gone, stop retrying
+                if "Unable to find session with ID" in str(e):
+                    logging.info(f"Session already gone during cleanup (attempt {attempt + 1}/{max_attempts}). Stopping retries.")
+                    break
+
+                if attempt < max_attempts - 1:
+                    logging.warning(f"Error quitting driver (attempt {attempt + 1}/{max_attempts}): {e}")
+                    time.sleep(1.0)
+                else:
+                    logging.warning(f"Failed to quit driver after {max_attempts} attempts: {e}")
+        
+        # Cleanup Xvfb
         try:
-            self.driver.quit()
-        except Exception as e:
-            logging.warning(f"Error quitting driver: {e}")
-        finally:
             if self._xvfb_proc:
                 self._xvfb_proc.terminate()
+                try:
+                    self._xvfb_proc.wait(timeout=3)
+                except:
+                    self._xvfb_proc.kill()
+                    try:
+                        self._xvfb_proc.wait(timeout=2)
+                    except:
+                        pass
+        except Exception as e:
+            logging.warning(f"Error terminating Xvfb: {e}")
+            
+        # Cleanup profile directory with retry
+        for attempt in range(3):
             try:
-                # Add a small delay before removing the directory to ensure Chrome has released it
                 time.sleep(0.5)
                 shutil.rmtree(self._profile_dir, ignore_errors=True)
+                break
             except Exception as e:
-                logging.warning(f"Error removing profile directory: {e}")
+                if attempt < 2:
+                    time.sleep(1.0)
+                else:
+                    logging.warning(f"Error removing profile directory: {e}")
     
-    def get_html_content(self, url: str, max_retries: int = 3) -> str | None:
+    def get_html_content(self, url: str, max_retries: int = 1) -> str | None:
         """
         Return the HTML content from the given URL, or None on failure.
         Will retry up to max_retries times if there's an error.
@@ -240,7 +362,7 @@ class SeleniumService:
                     continue
                 return None
 
-    def get_text_content(self, url: str, max_retries: int = 3, 
+    def get_text_content(self, url: str, max_retries: int = 1, 
                          progressive_timeout: int = 30, 
                          content_check_interval: int = 2,
                          min_content_length: int = 500) -> str | None:
@@ -346,13 +468,38 @@ class SeleniumService:
                 return None
                 
             except Exception as e:
-                error_msg = str(e)[:200]
-                logging.warning(f"Error getting text content for {url}, attempt {attempt+1}/{max_retries}: {error_msg}")
+                error_msg = str(e)
+
+                # Check for "Timed out receiving message from renderer" specifically. This error often indicates a specific page issue but the driver is likely still healthy
+                if "Timed out receiving message from renderer" in error_msg:
+                    logging.warning(f"Renderer timeout for {url}: {error_msg}. Resetting driver and attempting HTTPX fallback.")
+                    try:
+                        self.reset_driver()
+                    except:
+                        pass
+                    
+                    # Fallback to HTTPX immediately -> avoids infinite loops in Selenium
+                    # Since get_text_content returns only text, we discard links/url
+                    _, fallback_text, _ = self._fallback_fetch_httpx(url)
+                    return fallback_text
+
+                # Check for network/connection/DNS errors that warrant a driver reset
+                if "net::ERR_CONNECTION_TIMED_OUT" in error_msg or \
+                   "net::ERR_NAME_NOT_RESOLVED" in error_msg or \
+                   "net::ERR_CONNECTION_REFUSED" in error_msg:
+                    
+                    logging.warning(f"Network error for {url}: {error_msg[:100]}. Resetting driver...")
+                    try:
+                        self.reset_driver()
+                    except:
+                        pass
+                
+                logging.warning(f"Error getting text content for {url}, attempt {attempt+1}/{max_retries}: {error_msg[:200]}")
                 if attempt < max_retries - 1:
                     continue
                 return None
     
-    def get_all_possible_links(self, url: str, max_retries: int = 3,
+    def get_all_possible_links(self, url: str, max_retries: int = 1,
                               progressive_timeout: int = 20,
                               content_check_interval: int = 1) -> list[str]:
         """
@@ -412,10 +559,26 @@ class SeleniumService:
                                     current_links.add(urljoin(url, part.strip()))
                     
                     # 4. data-link or data-url attributes
+                    # 4. data-link or data-url or data-href attributes
                     for tag in soup.find_all(attrs={"data-link": True}):
                         current_links.add(urljoin(url, tag["data-link"]))
                     for tag in soup.find_all(attrs={"data-url": True}):
                         current_links.add(urljoin(url, tag["data-url"]))
+                    for tag in soup.find_all(attrs={"data-href": True}):
+                        current_links.add(urljoin(url, tag["data-href"]))
+
+                    # 5. role="link"
+                    for tag in soup.find_all(attrs={"role": "link"}):
+                        if tag.has_attr("href"):
+                            current_links.add(urljoin(url, tag["href"]))
+                        elif tag.has_attr("data-href"):
+                            current_links.add(urljoin(url, tag["data-href"]))
+                        elif tag.has_attr("onclick"): # try to parse onclick if present
+                             onclick = tag["onclick"]
+                             if "location" in onclick or "window.location" in onclick:
+                                for part in onclick.split("'"):
+                                    if "/" in part:
+                                        current_links.add(urljoin(url, part.strip()))
                     
                     # Update best links
                     best_links.update(current_links)
@@ -448,12 +611,190 @@ class SeleniumService:
                     continue
                 return []
                 
+                return []
+                
             except Exception as e:
                 error_msg = str(e)[:200]
+                
+                # Check for "Timed out receiving message from renderer" specifically
+                if "Timed out receiving message from renderer" in str(e):
+                    logging.warning(f"Renderer timeout for {url}: {error_msg}. Resetting driver and attempting HTTPX fallback.")
+                    try:
+                        self.reset_driver()
+                    except:
+                        pass
+                    
+                    # Fallback to HTTPX immediately
+                    fallback_links, _, _ = self._fallback_fetch_httpx(url)
+                    return fallback_links
+
                 logging.warning(f"Error getting links for {url}, attempt {attempt+1}/{max_retries}: {error_msg}")
                 if attempt < max_retries - 1:
                     continue
                 return []
+
+    def fetch_main_page_data(self, url: str, max_retries: int = 1,
+                            progressive_timeout: int = 30,
+                            check_interval: int = 2) -> tuple[list[str], str | None, str]:
+        """
+        Fetch both links and text content from the main page in a single visit.
+        Optimized to reduce page loads.
+        
+        Returns:
+            (list_of_links, text_content, effective_url)
+        """
+        for attempt in range(max_retries):
+            try:
+                self._reset_state()
+                self._ensure_valid_session()
+                
+                # Start loading the page
+                self.driver.get(url)
+                
+                start_time = time.time()
+                
+                # State tracking
+                best_links = set()
+                best_text = ""
+                
+                links_stable_count = 0
+                text_stable_count = 0
+                
+                prev_links_count = 0
+                prev_text_len = 0
+                
+                while time.time() - start_time < progressive_timeout:
+                    current_source = self.driver.page_source
+                    if not current_source:
+                        time.sleep(check_interval)
+                        continue
+                        
+                    soup = BeautifulSoup(current_source, "html.parser")
+                    
+                    # --- 1. Extract Links (before cleaning) ---
+                    current_links = set()
+                    # Standard <a>
+                    for a in soup.find_all("a", href=True):
+                        current_links.add(urljoin(url, a["href"]))
+                    # Forms
+                    for form in soup.find_all("form", action=True):
+                        current_links.add(urljoin(url, form["action"]))
+                    # Button/onclick (naive)
+                    for tag in soup.find_all(onclick=True):
+                        onclick = tag["onclick"]
+                        if "location" in onclick or "window.location" in onclick:
+                            for part in onclick.split("'"):
+                                if "/" in part:
+                                    current_links.add(urljoin(url, part.strip()))
+
+                    # data-link/url/href
+                    for tag in soup.find_all(attrs={"data-link": True}):
+                        current_links.add(urljoin(url, tag["data-link"]))
+                    for tag in soup.find_all(attrs={"data-url": True}):
+                        current_links.add(urljoin(url, tag["data-url"]))
+                    for tag in soup.find_all(attrs={"data-href": True}):
+                        current_links.add(urljoin(url, tag["data-href"]))
+
+                    # role="link"
+                    for tag in soup.find_all(attrs={"role": "link"}):
+                        if tag.has_attr("href"):
+                            current_links.add(urljoin(url, tag["href"]))
+                        elif tag.has_attr("data-href"):
+                            current_links.add(urljoin(url, tag["data-href"]))
+                                    
+                    # Update best links
+                    best_links.update(current_links)
+                    curr_links_count = len(best_links)
+                    
+                    if curr_links_count == prev_links_count:
+                        links_stable_count += 1
+                    else:
+                        links_stable_count = 0
+                        prev_links_count = curr_links_count
+                    
+                    # --- 2. Extract Text (after cleaning) ---
+                    # Clean soup
+                    blacklist_tags = [
+                        "script", "style", "noscript", "form", "svg", "canvas", "iframe",
+                        "button", "input", "select", "option", "link", "meta", "object",
+                        "embed", "video", "audio",
+                    ]
+                    for tag in soup(blacklist_tags):
+                        tag.decompose()
+                    for element in soup(text=lambda t: isinstance(t, Comment)):
+                        element.extract()
+                    for tag in soup.find_all(style=True):
+                        try:
+                            s = "".join(str(tag.get("style")).split()).lower()
+                            if "display:none" in s or "visibility:hidden" in s:
+                                tag.decompose()
+                        except: pass
+                        
+                    current_text = soup.get_text(separator=" ", strip=True) or ""
+                    current_text = " ".join(current_text.split())
+                    curr_text_len = len(current_text)
+                    
+                    if curr_text_len > len(best_text):
+                        best_text = current_text
+                        
+                    if curr_text_len == prev_text_len:
+                        text_stable_count += 1
+                    else:
+                        text_stable_count = 0
+                        prev_text_len = curr_text_len
+                        
+                    # Exit condition: Both stabilized (count >= 2) and we have data
+                    # Or we have "enough" data (e.g. text > 500 chars and some links)
+                    links_ready = (links_stable_count >= 2 and curr_links_count > 0)
+                    text_ready = (text_stable_count >= 2 and curr_text_len > 0) or curr_text_len > 1000
+                    
+                    if links_ready and text_ready:
+                        logging.info(f"Main page fetch stabilized for {url}. Links: {curr_links_count}, Text: {curr_text_len}")
+                        return list(best_links), best_text, url
+                        
+                    time.sleep(check_interval)
+                    
+                # Timeout fallback
+                return list(best_links), best_text, url
+                
+            except Exception as e:
+                error_msg = str(e)
+                
+                # Check for "Timed out receiving message from renderer" specifically. This error often indicates a specific page issue but the driver is likely still healthy
+                # Check for "Timed out receiving message from renderer" specifically
+                if "Timed out receiving message from renderer" in error_msg:
+                    logging.warning(f"Renderer timeout fetching main page data for {url}: {error_msg}. Resetting driver and attempting HTTPX fallback.")
+                    try:
+                        self.reset_driver()
+                    except:
+                        pass
+                    
+                    # Fallback to HTTPX immediately - Single attempt, returns results directly
+                    return self._fallback_fetch_httpx(url)
+
+                # Check for connection refused on HTTPS -> Try HTTP fallback
+                if "net::ERR_CONNECTION_REFUSED" in error_msg and url.startswith("https://"):
+                    logging.warning(f"Connection refused for HTTPS: {url}. Retrying with HTTP...")
+                    http_url = url.replace("https://", "http://", 1)
+                    # Use recursion with max_retries=2 (so it tries HTTP once and maybe 1 retry) => limit recursion
+                    # We pass max_retries=1 to ensure just one attempt at HTTP if we want to be strict
+                    return self.fetch_main_page_data(http_url, max_retries=1, progressive_timeout=progressive_timeout, check_interval=check_interval)
+
+                # Check for network/connection/DNS errors that warrant a driver reset
+                if "net::ERR_CONNECTION_TIMED_OUT" in error_msg or \
+                   "net::ERR_NAME_NOT_RESOLVED" in error_msg or \
+                   "net::ERR_CONNECTION_REFUSED" in error_msg:
+                    
+                    logging.warning(f"Network error for {url}: {error_msg[:100]}. Resetting driver...")
+                    try:
+                        self.reset_driver()
+                    except:
+                        pass
+
+                logging.warning(f"Error fetching main page data for {url}: {e}")
+                if attempt < max_retries - 1:
+                    continue
+                return [], None, url
 
     def _dict_to_row(self, d: dict[str, str | None]) -> list[str]:
         """Return a list in COLUMN_ORDER, filling missing keys with ''."""

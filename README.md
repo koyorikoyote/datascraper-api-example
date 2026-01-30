@@ -1,29 +1,38 @@
-Cloned Example of automated web data scraper and ERP system (Backend)
+Alembic commands
+fastapi alembic revision --autogenerate -m "Initial migration"
+fastapi alembic upgrade head
 
+Seeder commands
+python scripts/seed_db.py
 
-FastAPI backend providing unified activity management, company/contact tracking, authentication, and third-party integrations (Google, HubSpot)
+Docker commands
+docker exec -it sales_assistant_api /bin/bash
 
-**Key Features:**
+For fargate environment:
+docker-compose -f docker-compose.fargate.yaml up -d
+docker-compose -f docker-compose.fargate.yaml up --build -d
 
-- **Unified Activity System** - Centralized tracking of memos, calls, emails, and tasks across all company interactions
-- **Docker Containerization** - Full Docker Compose setup with containers `sales_assistant_api` and `sales_assistant_mysql` for development and production
-- **Authentication & Authorization** - JWT-based auth with OAuth2PasswordRequestForm, refresh tokens stored in HTTP-only cookies, role-based access control
-- **Third-party Integrations** - Google APIs (OAuth, Ads, Search), OpenAI integration, and Selenium Service web scraping capabilities
-- **Database Management** - MySQL 8.0 with SQLAlchemy ORM, Alembic migrations, automated seeding via `scripts/seed_db.py`
-- **API Routing** - FastAPI routers with `/api` prefix configuration, comprehensive error handling and CORS setup
-- **Multi-language Support** - Full English/Japanese localization with react-i18next
-- **Real-time Updates** - Live activity feeds and notifications with automatic token refresh
+Logging
+-------
+Application logs are printed to stdout using the standard Python ``logging``
+module. These logs will be forwarded to AWS CloudWatch in a future update.
 
-**Architecture:**
+Load Testing
+-------
+# Run the interactive load testing script (recommended)
+./scripts/run-fargate-test.sh
 
-```
-React 19 Frontend (web) ↔ FastAPI Backend (api) ↔ MySQL Database (Docker)
-```
+# Direct load testing with k6
+k6 run tests/load-tests/load-test.js
 
-**Development Environment:**
+# Run load test with custom parameters
+k6 run --vus 10 --duration 30s tests/load-tests/load-test.js
 
-- **Windows Development** - Optimized for Windows with PowerShell scripts, Docker Desktop integration
-- **Cross-Platform Compatibility** - Original Linux development adapted for Windows development workflow
-- **Authentication Issues** - Common problems include Alembic migration sync, double `/api` prefix, MySQL permissions
+# Run the rank endpoint scalability test (gradually increases load)
+k6 run tests/load-tests/rank-scalability-test.js
 
-**Target Users:** Sales representatives and managers handling company relationships and activities
+# Run the specific 3-parallel rank test (IDs 1-5)
+k6 run tests/load-tests/rank-specific-test.js
+
+# Monitor resource usage during testing
+docker stats sales_assistant_api_fargate sales_assistant_mysql_fargate

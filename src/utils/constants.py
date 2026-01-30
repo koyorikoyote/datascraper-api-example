@@ -3,8 +3,8 @@ from typing import Any
 
 class GoogleConst:
     GOOGLE_API_URL = "https://www.googleapis.com/customsearch/v1"
-    PAGE_SIZE = 1
-    ITEMS = 101 # 101 eqivalent to 100 searches
+    PAGE_SIZE = 10
+    ITEMS = 10 # 100 items total (10 pages * 10 items)
     TTL_SECONDS = 15 * 60
     HTTP_TIMEOUT = 10.0
     CONCURRENCY = 10

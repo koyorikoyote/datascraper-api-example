@@ -46,28 +46,43 @@ class ChatGPTService:
             **kwargs,
         }
         
-        try:
-            response = httpx.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=60.0,
-            )
-            
-            response.raise_for_status()
-            
-            data = response.json()
-            return data["choices"][0]["message"]["content"].strip()
-            
-        except httpx.HTTPStatusError as e:
-            # Let the decorator handle 429s, catch others
-            if e.response.status_code == 429:
-                raise # Re-raise for decorator
-            logging.error(f"HTTP error in ChatGPT API: {e.response.status_code} - {e.response.text}")
-            return ''
-        except Exception as e:
-            logging.error(f"Error in ChatGPT API: {str(e)}")
-            return ''
+        max_attempts = 2  # Try once, retry once
+        for attempt in range(max_attempts):
+            try:
+                response = httpx.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=60.0,
+                )
+                
+                response.raise_for_status()
+                
+                data = response.json()
+                return data["choices"][0]["message"]["content"].strip()
+                
+            except httpx.HTTPStatusError as e:
+                # Let the decorator handle 429s
+                if e.response.status_code == 429:
+                    raise
+                # Retry on 5xx server errors (502 Bad Gateway, etc.)
+                if 500 <= e.response.status_code < 600:
+                    if attempt < max_attempts - 1:
+                        logging.warning(f"ChatGPT API server error {e.response.status_code} (attempt {attempt+1}/{max_attempts}). Retrying...")
+                        time.sleep(2)
+                        continue
+                logging.error(f"HTTP error in ChatGPT API: {e.response.status_code} - {e.response.text}")
+                return ''
+            except (httpx.TimeoutException, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+                if attempt < max_attempts - 1:
+                    logging.warning(f"ChatGPT API timeout (attempt {attempt+1}/{max_attempts}): {str(e)}. Retrying...")
+                    time.sleep(2)  # Small wait before retry
+                    continue
+                logging.error(f"ChatGPT API timeout after {max_attempts} attempts: {str(e)}")
+                return ''
+            except Exception as e:
+                logging.error(f"Error in ChatGPT API: {str(e)}")
+                return ''
 
     @staticmethod
     def parse_gpt_json(raw: str) -> Dict[str, Any]:

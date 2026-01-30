@@ -1,0 +1,131 @@
+services:
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sales_assistant_api
+    restart: always
+    shm_size: "2g"
+    ports:
+      - "8000:8000"
+      - "4444:4444"
+      - "7900:7900"
+    depends_on:
+      - sales_assistant_db
+    environment:
+      MYSQL_HOST: ${MYSQL_HOST:-sales_assistant_db}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      SECRET_KEY: ${SECRET_KEY}
+      ALGORITHM: ${ALGORITHM}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      GOOGLE_CSE_ID: ${GOOGLE_CSE_ID}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET}
+      GOOGLE_ADS_DEVELOPER_TOKEN: ${GOOGLE_ADS_DEVELOPER_TOKEN}
+      GOOGLE_ADS_REFRESH_TOKEN: ${GOOGLE_ADS_REFRESH_TOKEN}
+      GOOGLE_ADS_CUSTOMER_ID: ${GOOGLE_ADS_CUSTOMER_ID}
+      GOOGLE_OAUTH_PROJECT_ID: ${GOOGLE_OAUTH_PROJECT_ID}
+      GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+      HUBSPOT_CLIENT_ID: ${HUBSPOT_CLIENT_ID}
+      HUBSPOT_CLIENT_SECRET: ${HUBSPOT_CLIENT_SECRET}
+      HUBSPOT_REDIRECT_URI: ${HUBSPOT_REDIRECT_URI}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN}
+      SELENIUM_GRID_URL: ${SELENIUM_GRID_URL}
+      SELENIUM_UI_URL: ${SELENIUM_UI_URL}
+      AWS_REGION: ${AWS_REGION}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      SQS_JOB_QUEUE_URL: ${SQS_JOB_QUEUE_URL}
+      SQS_JOB_DLQ_URL: ${SQS_JOB_DLQ_URL}
+    volumes:
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+      - ./requirements.txt:/app/requirements.txt
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+
+  sales_assistant_db:
+    image: mysql:8.0.33
+    container_name: sales_assistant_mysql
+    restart: always
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_HOST: ${MYSQL_HOST:-sales_assistant_db}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-sales_assistant}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+    volumes:
+      - mysqldb:/var/lib/mysql
+
+  pma:
+    image: phpmyadmin/phpmyadmin:latest
+    container_name: sales_assistant_phpmyadmin
+    ports:
+      - "8888:80"
+    volumes:
+      - pma-session-store:/sessions
+    environment:
+      PMA_HOST: ${DB_HOST:-sales_assistant_db}
+      PMA_USER: ${DB_USERNAME:-rootuser}
+      PMA_PASSWORD: ${DB_PASSWORD:-root}
+    depends_on:
+      - sales_assistant_db
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    container_name: sales_assistant_worker
+    restart: always
+    depends_on:
+      - sales_assistant_db
+    environment:
+      MYSQL_HOST: ${MYSQL_HOST:-sales_assistant_db}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      AWS_REGION: ${AWS_REGION}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      SQS_JOB_QUEUE_URL: ${SQS_JOB_QUEUE_URL}
+      SQS_JOB_DLQ_URL: ${SQS_JOB_DLQ_URL}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      GOOGLE_CSE_ID: ${GOOGLE_CSE_ID}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET}
+      GOOGLE_ADS_DEVELOPER_TOKEN: ${GOOGLE_ADS_DEVELOPER_TOKEN}
+      GOOGLE_ADS_REFRESH_TOKEN: ${GOOGLE_ADS_REFRESH_TOKEN}
+      GOOGLE_ADS_CUSTOMER_ID: ${GOOGLE_ADS_CUSTOMER_ID}
+      GOOGLE_OAUTH_PROJECT_ID: ${GOOGLE_OAUTH_PROJECT_ID}
+      GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+      HUBSPOT_CLIENT_ID: ${HUBSPOT_CLIENT_ID}
+      HUBSPOT_CLIENT_SECRET: ${HUBSPOT_CLIENT_SECRET}
+      HUBSPOT_REDIRECT_URI: ${HUBSPOT_REDIRECT_URI}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN}
+      SELENIUM_GRID_URL: http://fastapi:4444/wd/hub  # Always use internal container network
+      SELENIUM_UI_URL: ${SELENIUM_UI_URL}
+      WORKER_POLL_INTERVAL: ${WORKER_POLL_INTERVAL:-20}
+      WORKER_VISIBILITY_TIMEOUT: ${WORKER_VISIBILITY_TIMEOUT:-900}
+      WORKER_MAX_MESSAGES: ${WORKER_MAX_MESSAGES:-1}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./src:/app/src
+      - ./worker:/app/worker
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+    command: python /app/worker/main.py
+
+volumes:
+  mysqldb:
+  pma-session-store:

@@ -1,0 +1,107 @@
+version: '3.8'
+
+services:
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile.fargate
+    container_name: sales_assistant_api_fargate
+    restart: always
+    # Fargate equivalent constraints
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'    # 0.5 vCPU limit as per Fargate
+          memory: 1G     # 1 GB memory limit as per Fargate
+        reservations:
+          cpus: '0.25'   # Typical Fargate reservation pattern
+          memory: 512M   # Typical Fargate reservation pattern
+    # Increased shared memory size to match regular Docker setup
+    shm_size: "2g"
+    ports:
+      - "8000:8000"
+      - "4444:4444"
+      - "7900:7900" 
+    depends_on:
+      - sales_assistant_db
+    environment:
+      # Database configuration
+      MYSQL_HOST: ${MYSQL_HOST:-sales_assistant_db}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      # Authentication
+      SECRET_KEY: ${SECRET_KEY}
+      ALGORITHM: ${ALGORITHM}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES}
+      # Google services
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      GOOGLE_CSE_ID: ${GOOGLE_CSE_ID}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET}
+      GOOGLE_ADS_DEVELOPER_TOKEN: ${GOOGLE_ADS_DEVELOPER_TOKEN}
+      GOOGLE_ADS_REFRESH_TOKEN: ${GOOGLE_ADS_REFRESH_TOKEN}
+      GOOGLE_ADS_CUSTOMER_ID: ${GOOGLE_ADS_CUSTOMER_ID}
+      GOOGLE_OAUTH_PROJECT_ID: ${GOOGLE_OAUTH_PROJECT_ID}
+      GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI}
+      # OpenAI
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+      # HubSpot
+      HUBSPOT_CLIENT_ID: ${HUBSPOT_CLIENT_ID}
+      HUBSPOT_CLIENT_SECRET: ${HUBSPOT_CLIENT_SECRET}
+      HUBSPOT_REDIRECT_URI: ${HUBSPOT_REDIRECT_URI}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN}
+      # Selenium
+      SELENIUM_GRID_URL: ${SELENIUM_GRID_URL}
+      SELENIUM_UI_URL: ${SELENIUM_UI_URL}
+      # Selenium Grid configuration
+      SE_NODE_MAX_SESSIONS: "1"
+      SE_NODE_SESSION_TIMEOUT: "3600"
+      SE_OPTS: "--log-level INFO --host 0.0.0.0 --port 4444"
+      JAVA_OPTS: "-Xmx512m -XX:+UseG1GC -XX:+UseStringDeduplication"
+      SE_SESSION_REQUEST_TIMEOUT: "180"
+      SE_SESSION_RETRY_INTERVAL: "5"
+      SE_HEALTHCHECK_INTERVAL: "30"
+      SE_RELAX_CHECKS: "true"
+      SE_REJECT_UNSUPPORTED_CAPS: "false"
+      # Environment identifier
+      FARGATE_ENV: "true"
+      # Increase request timeout
+      REQUEST_TIMEOUT: "3600"
+    volumes:
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+      - ./requirements.txt:/app/requirements.txt
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+    entrypoint: ["/usr/local/bin/docker-entrypoint.sh"]
+    # Removed the command override to use the entrypoint script
+
+  sales_assistant_db:
+    image: mysql:8.0.33
+    container_name: sales_assistant_mysql_fargate
+    restart: always
+    # Minimal resources for the database to ensure most resources go to the app
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_HOST: ${MYSQL_HOST:-sales_assistant_db}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-sales_assistant}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+    volumes:
+      - mysqldb_fargate:/var/lib/mysql
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --innodb_buffer_pool_size=256M --max_connections=50
+
+  # Removed phpMyAdmin to focus resources on the main application for testing
+
+volumes:
+  mysqldb_fargate:

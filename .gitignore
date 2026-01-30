@@ -105,10 +105,6 @@ venv.bak/
 
 .idea/*
 .qodo
+.env
 daily_report.py
 *.zip
-
-.env
-.env.example
-docker-compose.fargate.yaml
-docker-compose.yaml
