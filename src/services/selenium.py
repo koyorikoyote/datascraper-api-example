@@ -64,7 +64,16 @@ class SeleniumService:
         self._profile_dir = tempfile.mkdtemp(prefix=f"selenium-profile-{unique_id}-", dir="/tmp")
         
         # Initialize the driver
-        self.driver = self._create_driver()
+        try:
+            self.driver = self._create_driver()
+        except Exception as e:
+            # If driver creation fails, clean up the profile directory immediately
+            logging.error(f"Failed to create driver, cleaning up profile: {self._profile_dir}")
+            try:
+                shutil.rmtree(self._profile_dir, ignore_errors=True)
+            except Exception:
+                pass
+            raise e
 
         atexit.register(self._cleanup)
 
@@ -330,13 +339,16 @@ class SeleniumService:
         for attempt in range(3):
             try:
                 time.sleep(0.5)
-                shutil.rmtree(self._profile_dir, ignore_errors=True)
+                # Check if directory exists before trying to remove
+                if os.path.exists(self._profile_dir):
+                    shutil.rmtree(self._profile_dir, ignore_errors=False) # Capture errors to retry
                 break
             except Exception as e:
+                logging.warning(f"Error removing profile directory (attempt {attempt+1}/3): {e}")
                 if attempt < 2:
                     time.sleep(1.0)
                 else:
-                    logging.warning(f"Error removing profile directory: {e}")
+                    logging.error(f"Failed to remove profile directory after 3 attempts: {self._profile_dir}")
     
     def get_html_content(self, url: str, max_retries: int = 1) -> str | None:
         """

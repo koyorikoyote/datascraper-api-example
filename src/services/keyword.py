@@ -1001,9 +1001,11 @@ class KeywordService:
             )
 
             # Initialize SeleniumService once for all items
-            selenium_service = SeleniumService()
-
+            selenium_service = None
+            
             try:
+                selenium_service = SeleniumService()
+
                 for idx, serp in enumerate(serp_results):
                     # Skip previously failed items to avoid re-processing loop after crash
                     if serp.status == StatusConst.FAILED:
@@ -1044,10 +1046,11 @@ class KeywordService:
                         continue
             finally:
                 # Clean up the selenium service after all items are processed
-                try:
-                    selenium_service._cleanup(force=True)
-                except Exception as cleanup_error:
-                    logging.error("Error cleaning up selenium service: %s", cleanup_error)
+                if selenium_service:
+                    try:
+                        selenium_service._cleanup(force=True)
+                    except Exception as cleanup_error:
+                        logging.error("Error cleaning up selenium service: %s", cleanup_error)
 
             # Check for failed SERP results
             failed_count = self.serp_repo.count_failed_by_keyword(keyword_id)
