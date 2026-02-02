@@ -49,9 +49,6 @@ class SeleniumService:
         self.headless = headless
         self.remote_url = remote_url
         
-        # Clean up any stale profiles from previous crashed runs to free up space
-        self._clean_stale_profiles()
-        
         # spin up Xvfb only when *headed*
         self._xvfb_proc = None
         if not headless and "DISPLAY" not in os.environ:
@@ -66,48 +63,13 @@ class SeleniumService:
         unique_id = f"{uuid.uuid4()}-{int(time.time())}"
         self._profile_dir = tempfile.mkdtemp(prefix=f"selenium-profile-{unique_id}-", dir="/tmp")
         
-        try:
-            # Register cleanup immediately
-            atexit.register(self._cleanup)
-            
-            # Initialize the driver
-            self.driver = self._create_driver()
-        except Exception:
-            logging.error("Failed to initialize SeleniumService, cleaning up profile directory immediately.")
-            self._cleanup(force=True)
-            raise
+        # Initialize the driver
+        self.driver = self._create_driver()
+
+        atexit.register(self._cleanup)
 
         # Suppress benign "Connection pool is full" warnings from urllib3
         logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
-
-    def _clean_stale_profiles(self):
-        """Clean up orphaned selenium profiles from /tmp that are older than 1 hour."""
-        try:
-            tmp_dir = "/tmp"
-            if not os.path.exists(tmp_dir):
-                return
-
-            current_time = time.time()
-            max_age = 3600  # 1 hour in seconds
-            
-            # Find all directories matching the pattern
-            # Using listdir instead of glob for better performance in loose environments
-            for filename in os.listdir(tmp_dir):
-                if filename.startswith("selenium-profile-"):
-                    dir_path = os.path.join(tmp_dir, filename)
-                    try:
-                        # Check modification time
-                        if os.path.isdir(dir_path):
-                            stat = os.stat(dir_path)
-                            if current_time - stat.st_mtime > max_age:
-                                logging.info(f"Removing stale selenium profile: {dir_path}")
-                                shutil.rmtree(dir_path, ignore_errors=True)
-                    except Exception as e:
-                        # Just log and continue, don't crash on maintenance
-                        logging.debug(f"Could not check/remove stale profile {dir_path}: {e}")
-                        
-        except Exception as e:
-            logging.warning(f"Error during stale profile cleanup: {e}")
         
     def _create_driver(self):
         """Create a new WebDriver instance with the configured options."""
@@ -323,16 +285,6 @@ class SeleniumService:
         self._cleanup()
 
     def _cleanup(self, force=False):
-        """
-        Clean up resources (Driver, Xvfb, Temp Dir). 
-        Safe to call multiple times.
-        """
-        # Unregister atexit handler since we are cleaning up now
-        try:
-            atexit.unregister(self._cleanup)
-        except Exception:
-            pass
-
         # Skip cleanup if we want to keep browser open on failure
         if not force and getattr(self, '_keep_open_on_failure', False):
             logging.info("Keeping browser open due to failure")
@@ -374,19 +326,17 @@ class SeleniumService:
         except Exception as e:
             logging.warning(f"Error terminating Xvfb: {e}")
             
-        # Cleanup profile directory with retry and robust error handling
-        if hasattr(self, '_profile_dir') and self._profile_dir and os.path.exists(self._profile_dir):
-            for attempt in range(3):
-                try:
-                    time.sleep(0.5)
-                    shutil.rmtree(self._profile_dir)  # Removed ignore_errors=True to catch errors, but loop handles them
-                    break
-                except Exception as e:
-                    if attempt < 2:
-                        logging.debug(f"Retrying profile cleanup ({attempt+1}/3): {e}")
-                        time.sleep(1.0)
-                    else:
-                        logging.warning(f"Error removing profile directory {self._profile_dir}: {e}")
+        # Cleanup profile directory with retry
+        for attempt in range(3):
+            try:
+                time.sleep(0.5)
+                shutil.rmtree(self._profile_dir, ignore_errors=True)
+                break
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(1.0)
+                else:
+                    logging.warning(f"Error removing profile directory: {e}")
     
     def get_html_content(self, url: str, max_retries: int = 1) -> str | None:
         """
