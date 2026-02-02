@@ -230,32 +230,17 @@ class SeleniumService:
 
     def reset_driver(self):
         """
-        Forcefully quit the current driver and create a new one with a FRESH profile.
-        Useful when a thread is stuck, the driver is in a bad state, or the profile is locked.
+        Forcefully quit the current driver and create a new one.
+        Useful when a thread is stuck or the driver is in a bad state.
         """
-        logging.warning("Resetting driver and rotating profile...")
-        
-        # 1. Full cleanup of old session and dir
-        # This attempts to remove the old profile dir, but if it's locked, it logs a warning and moves on.
-        # Crucially, we won't try to reuse it.
         try:
-            self._cleanup(force=True)
+            logging.warning("offloading stuck driver...")
+            if self.driver:
+                self.driver.quit()
         except Exception as e:
-            logging.warning(f"Error during cleanup in reset_driver: {e}")
-
-        # 2. Create fresh profile dir
-        unique_id = f"{uuid.uuid4()}-{int(time.time())}"
-        self._profile_dir = tempfile.mkdtemp(prefix=f"selenium-profile-{unique_id}-", dir="/tmp")
-        logging.info(f"Created new profile directory for reset: {self._profile_dir}")
+            logging.warning(f"Error quitting driver during reset: {e}")
         
-        # 3. Re-register cleanup for the NEW profile (since _cleanup unregisters it)
-        try:
-            atexit.register(self._cleanup)
-        except Exception as e:
-            logging.warning(f"Failed to re-register atexit cleanup: {e}")
-
-        # 4. Create new driver session using the new profile
-        logging.info("Creating new driver session with fresh profile...")
+        logging.info("Creating new driver session...")
         self.driver = self._create_driver()
 
     def _reset_state(self):
