@@ -1,6 +1,7 @@
 import subprocess
 import tempfile, shutil, atexit
 import os
+import glob
 import uuid
 import time
 import socket
@@ -31,6 +32,50 @@ COLUMN_ORDER = [
     "subject", "body",
 ]
 
+# Stale threshold: directories older than this (in seconds) will be cleaned up
+STALE_PROFILE_THRESHOLD_SECONDS = 1800  # 30 minutes
+
+
+def cleanup_stale_selenium_profiles():
+    """
+    Clean up stale Selenium profile directories from /tmp.
+    Called on SeleniumService init to prevent disk space exhaustion.
+    Only removes directories older than STALE_PROFILE_THRESHOLD_SECONDS.
+    """
+    try:
+        tmp_dir = "/tmp"
+        if not os.path.exists(tmp_dir):
+            return
+        
+        current_time = time.time()
+        pattern = os.path.join(tmp_dir, "selenium-profile-*")
+        stale_dirs = glob.glob(pattern)
+        
+        cleaned_count = 0
+        for dir_path in stale_dirs:
+            try:
+                if not os.path.isdir(dir_path):
+                    continue
+                    
+                # Check directory age using modification time
+                dir_mtime = os.path.getmtime(dir_path)
+                age_seconds = current_time - dir_mtime
+                
+                if age_seconds > STALE_PROFILE_THRESHOLD_SECONDS:
+                    # Try to remove the stale directory
+                    shutil.rmtree(dir_path, ignore_errors=True)
+                    cleaned_count += 1
+                    logging.info(f"Cleaned stale Selenium profile: {dir_path} (age: {int(age_seconds)}s)")
+            except Exception as e:
+                # Log but continue with other directories
+                logging.warning(f"Failed to clean stale profile {dir_path}: {e}")
+                continue
+        
+        if cleaned_count > 0:
+            logging.info(f"Cleaned {cleaned_count} stale Selenium profile directories")
+    except Exception as e:
+        logging.warning(f"Error during stale profile cleanup: {e}")
+
 
 class RendererTimeoutError(Exception):
     """Raised when Selenium renderer times out, indicating a critical page failure."""
@@ -46,6 +91,9 @@ class SeleniumService:
         # Environment variable for Selenium Grid URL has to be localhost even in production
         remote_url: str = get_env("SELENIUM_GRID_URL", default="http://localhost:4444/wd/hub"),
     ) -> None:
+        # Clean up stale profile directories before creating a new one
+        cleanup_stale_selenium_profiles()
+        
         self.headless = headless
         self.remote_url = remote_url
         
@@ -341,14 +389,18 @@ class SeleniumService:
                 time.sleep(0.5)
                 # Check if directory exists before trying to remove
                 if os.path.exists(self._profile_dir):
-                    shutil.rmtree(self._profile_dir, ignore_errors=False) # Capture errors to retry
+                    # Use ignore_errors=True on final attempt to ensure we don't leave cleanup incomplete
+                    use_ignore = (attempt == 2)
+                    shutil.rmtree(self._profile_dir, ignore_errors=use_ignore)
+                    logging.info(f"Cleaned up profile directory: {self._profile_dir}")
                 break
             except Exception as e:
                 logging.warning(f"Error removing profile directory (attempt {attempt+1}/3): {e}")
                 if attempt < 2:
                     time.sleep(1.0)
                 else:
-                    logging.error(f"Failed to remove profile directory after 3 attempts: {self._profile_dir}")
+                    # Final attempt - log but don't raise, stale cleanup will handle it later
+                    logging.error(f"Failed to remove profile directory after 3 attempts: {self._profile_dir}. Will be cleaned by stale cleanup later.")
     
     def get_html_content(self, url: str, max_retries: int = 1) -> str | None:
         """

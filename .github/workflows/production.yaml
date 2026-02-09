@@ -1,0 +1,164 @@
+name: CI-CD - Sales-Assistant API
+
+on:
+  push:
+    branches: [ production ]    # deploy every push to production
+  workflow_dispatch:            # manual trigger
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REGISTRY: 081334667041.dkr.ecr.ap-northeast-1.amazonaws.com
+  ECR_REPOSITORY: sales-assistant-app
+  ECR_REPOSITORY_WORKER: sales-assistant-worker
+  CLUSTER_NAME: sales-assistant-cluster
+  SERVICE_NAME: sales-assistant-svc
+  SERVICE_NAME_WORKER: sales-assistant-worker
+  TASK_FAMILY:  sales-assistant-task
+  TASK_FAMILY_WORKER:  sales-assistant-task
+ 
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write           # OIDC auth for AWS
+      contents: read
+
+    steps:
+    # ---------- 1.  Checkout code ----------
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # ---------- 2.  Configure AWS creds via OIDC ----------
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::081334667041:role/GitHubActionsECRDeploy   # <-- create once in IAM
+        aws-region: ${{ env.AWS_REGION }}
+
+    # ---------- 3.  Set up Docker Buildx ----------
+    - name: Set up QEMU (multi-arch)
+      uses: docker/setup-qemu-action@v3
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    # ---------- 4.  Log in to Amazon ECR ----------
+    - name: Login to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v2
+
+    # ---------- 5. Build & push API image ----------
+    - name: Build and push API
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: Dockerfile
+        push: true
+        tags: |
+          ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+    # ---------- 6. Build & push worker image (with Selenium Grid) ----------
+    - name: Build and push worker
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: Dockerfile.fargate
+        push: true
+        tags: |
+          ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY_WORKER }}:latest
+          ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY_WORKER }}:${{ github.sha }}
+
+    # ---------- 7. Fetch current API task definition ----------
+    - name: Download API task definition
+      id: taskdef
+      run: |
+        aws ecs describe-task-definition \
+          --task-definition $TASK_FAMILY \
+          --query 'taskDefinition' \
+          --output json > td-app.json
+
+    # ---------- 8. Clean + update API image URI (remove entryPoint) ----------
+    - name: Prepare new API task definition
+      id: newtask
+      run: |
+        jq \
+          'del(
+             .taskDefinitionArn,
+             .revision,
+             .status,
+             .requiresAttributes,
+             .compatibilities,
+             .registeredAt,
+             .registeredBy,
+             .containerDefinitions[0].entryPoint
+           )
+           | .containerDefinitions[0].image =
+             "${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"' \
+          td-app.json > td-app-new.json
+        echo "FILE=td-app-new.json" >> "$GITHUB_OUTPUT"
+
+    # ---------- 9. Register new API task definition ----------
+    - name: Register new API task definition
+      id: register
+      run: |
+        REVISION_ARN=$(aws ecs register-task-definition \
+          --cli-input-json file://${{ steps.newtask.outputs.FILE }} \
+          --query 'taskDefinition.taskDefinitionArn' \
+          --output text)
+        echo "REVISION_ARN=$REVISION_ARN" >> "$GITHUB_OUTPUT"
+
+    # ---------- 10. Deploy new revision to API ECS service ----------
+    - name: Deploy API service
+      run: |
+        aws ecs update-service \
+          --cluster $CLUSTER_NAME \
+          --service $SERVICE_NAME \
+          --task-definition ${{ steps.register.outputs.REVISION_ARN }}
+
+    # ---------- 11. Fetch current worker task definition ----------
+    - name: Download worker task definition
+      id: worker-taskdef
+      run: |
+        aws ecs describe-task-definition \
+          --task-definition $TASK_FAMILY_WORKER \
+          --query 'taskDefinition' \
+          --output json > td-worker.json
+
+    # ---------- 12. Clean + update worker image URI and set entryPoint ----------
+    - name: Prepare new worker task definition
+      id: worker-newtask
+      run: |
+        jq \
+          'del(
+             .taskDefinitionArn,
+             .revision,
+             .status,
+             .requiresAttributes,
+             .compatibilities,
+             .registeredAt,
+             .registeredBy
+           )
+           | .containerDefinitions[0].image =
+             "${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY_WORKER }}:${{ github.sha }}"
+           | .containerDefinitions[0].entryPoint =
+             ["/usr/local/bin/docker-entrypoint-worker.sh"]' \
+          td-worker.json > td-worker-new.json
+        echo "FILE=td-worker-new.json" >> "$GITHUB_OUTPUT"
+
+    # ---------- 13. Register new worker task definition ----------
+    - name: Register new worker task definition
+      id: worker-register
+      run: |
+        WORKER_REVISION_ARN=$(aws ecs register-task-definition \
+          --cli-input-json file://${{ steps.worker-newtask.outputs.FILE }} \
+          --query 'taskDefinition.taskDefinitionArn' \
+          --output text)
+        echo "REVISION_ARN=$WORKER_REVISION_ARN" >> "$GITHUB_OUTPUT"
+
+    # ---------- 14. Deploy new revision to worker ECS service ----------
+    - name: Deploy worker service
+      run: |
+        aws ecs update-service \
+          --cluster $CLUSTER_NAME \
+          --service $SERVICE_NAME_WORKER \
+          --task-definition ${{ steps.worker-register.outputs.REVISION_ARN }}
