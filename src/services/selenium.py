@@ -5,6 +5,7 @@ import glob
 import uuid
 import time
 import socket
+import threading
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from bs4 import BeautifulSoup, Comment
@@ -252,15 +253,40 @@ class SeleniumService:
         Forcefully quit the current driver and create a new one.
         Useful when a thread is stuck or the driver is in a bad state.
         """
-        try:
-            logging.warning("offloading stuck driver...")
-            if self.driver:
-                self.driver.quit()
-        except Exception as e:
-            logging.warning(f"Error quitting driver during reset: {e}")
+        logging.warning("offloading stuck driver...")
+        self._quit_driver_with_timeout(timeout_seconds=10)
         
         logging.info("Creating new driver session...")
         self.driver = self._create_driver()
+
+    def _quit_driver_with_timeout(self, timeout_seconds: int = 10):
+        """
+        Quit the driver with a timeout to prevent blocking indefinitely.
+        If quit() hangs (stuck Grid session), we abandon the reference and proceed.
+        The Grid's session timeout will eventually clean up orphaned sessions.
+        """
+        if not self.driver:
+            return
+            
+        quit_success = [False]  # Use list for thread-safe mutation
+        
+        def quit_in_thread():
+            try:
+                self.driver.quit()
+                quit_success[0] = True
+            except Exception as e:
+                logging.warning(f"Error during driver quit: {e}")
+        
+        quit_thread = threading.Thread(target=quit_in_thread, daemon=True)
+        quit_thread.start()
+        quit_thread.join(timeout=timeout_seconds)
+        
+        if quit_thread.is_alive():
+            logging.warning(f"driver.quit() timed out after {timeout_seconds}s, abandoning session reference")
+            # Abandon the driver reference - Grid's session timeout will clean it up
+            self.driver = None
+        elif quit_success[0]:
+            logging.info("Driver quit successfully")
 
     def _reset_state(self):
         """
@@ -347,26 +373,11 @@ class SeleniumService:
             logging.info("Keeping browser open due to failure")
             return
             
-        # Try to quit the driver multiple times with increasing delays
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            try:
-                if hasattr(self, 'driver') and self.driver:
-                    self.driver.quit()
-                    # Give Chrome time to fully shut down
-                    time.sleep(1.0 if attempt == 0 else 2.0)
-                    break
-            except Exception as e:
-                # If session is already gone, stop retrying
-                if "Unable to find session with ID" in str(e):
-                    logging.info(f"Session already gone during cleanup (attempt {attempt + 1}/{max_attempts}). Stopping retries.")
-                    break
-
-                if attempt < max_attempts - 1:
-                    logging.warning(f"Error quitting driver (attempt {attempt + 1}/{max_attempts}): {e}")
-                    time.sleep(1.0)
-                else:
-                    logging.warning(f"Failed to quit driver after {max_attempts} attempts: {e}")
+        # Quit driver with timeout to prevent blocking indefinitely on stuck sessions
+        if hasattr(self, 'driver') and self.driver:
+            self._quit_driver_with_timeout(timeout_seconds=10)
+            # Give Chrome time to fully shut down
+            time.sleep(1.0)
         
         # Cleanup Xvfb
         try:
